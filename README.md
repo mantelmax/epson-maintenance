@@ -68,10 +68,15 @@ WorkForce and modern Stylus models:
   engineering projects (see credits) and is expected to work across the
   EcoTank line; live validation on the ET-M1120 is still pending.
 - Status and ink levels rely on Epson's SNMP `@BDC ST2` frames, which the
-  development printer answers, as do the reference projects' printers.
+  development printer answers, as do the reference projects' printers. The
+  EcoTank ink layout (a 2-byte payload length after the marker, then per-tank
+  entries of `[slot, colourCode, percent]`) is decoded and was validated
+  against a captured ET-2820 frame in the epson-reset suite and live on the
+  ET-M1120.
 
 Caveats: models differ in nozzle groups and in what their SNMP layout
-reports. If your printer performs the cleanings but shows no ink data,
+reports. Ink levels decode for the EcoTank models tested (ET-M1120, ET-2820);
+on a model that performs the cleanings but reports a different ink field,
 everything else still works — and `--group` lets you target nozzle groups
 1-5 where a model needs it.
 
@@ -157,7 +162,11 @@ reverse-engineered bit for deep cleaning):
 | **Power Cleaning**, group N | `CH 00 1N` | `43 48 02 00 00 1N` |
 
 Status and ink levels are read through SNMP (UDP 161) with Epson's `@BDC ST2`
-status block; state, ink percentages and waste-ink tanks are decoded from it.
+status block: after the `@BDC ST2` marker comes a 2-byte little-endian payload
+length, then type/length/value fields. The ink field (0x0F) holds one entry
+per tank — `[slot, colourCode, percent]` — so the colour name comes from the
+2nd byte, not the (arbitrary) slot. State, error code, ink percentages,
+serial number and waste-ink tanks (0x0D, when reported) are decoded from it.
 The same channel serves as a safety gate (no new jobs while busy) and to
 monitor a running cleaning until the printer reports idle again.
 
@@ -196,9 +205,11 @@ full job monitoring, USB path, dry run and the GUI wiring.
   engineering projects (see credits) but is not part of escputil; it is
   expected to work on EcoTank models, yet a live field test on the ET-M1120
   is still pending.
-- SNMP status works against the development printer (state and ink are
-  reported); the decoding covers the common `@BDC ST2` layout, exotic fields
-  fall back to a readable raw display.
+- SNMP status works against the development printer: state, ink level
+  (Black ~100%) and serial number are reported. The EcoTank ST2 ink decoding
+  is cross-checked against a captured ET-2820 frame in the epson-reset test
+  suite (Black 11 / Yellow 65 / Magenta 63 / Cyan 66); exotic fields fall back
+  to a readable raw display.
 - Printhead alignment is not implemented (escputil can do it over USB).
 
 ## Troubleshooting

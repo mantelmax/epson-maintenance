@@ -129,15 +129,34 @@ STATUS_LABELS = {
 BUSY = {1, 2, 7, 15}
 IDLE = {3, 4}
 
+# EcoTank ink colour codes (the 2nd byte of each ink entry). Validated on the
+# ET-M1120 (mono) and against a captured ET-2820 frame in the epson-reset test
+# suite (Black 11 / Yellow 65 / Magenta 63 / Cyan 66). This is the EcoTank/CMY
+# ordering -- different from the slot numbers the older Stylus Pro x900 used
+# as colour ids, which is what the previous (x900-derived) map was keyed on.
 INK_NAMES = {
-    0x01: "Photo Black",
-    0x03: "Cyan",
-    0x04: "Magenta",
-    0x05: "Yellow",
-    0x06: "Light Cyan",
-    0x07: "Light Magenta",
-    0x0A: "Light Black",
-    0x0B: "Matte Black",
+    0x00: "Black",
+    0x01: "Cyan",
+    0x02: "Magenta",
+    0x03: "Yellow",
+    0x04: "Light Cyan",
+    0x05: "Light Magenta",
+    0x06: "Light Black",
+    0x0A: "Matte Black",
+}
+
+# Error codes for field 0x02 (names follow escputil/Gutenprint and epson-reset).
+ERROR_NAMES = {
+    0x00: "fatal error",
+    0x02: "cover open",
+    0x04: "paper jam",
+    0x05: "ink out",
+    0x06: "paper out",
+    0x0B: "double feed",
+    0x10: "waste ink pad full",
+    0x16: "cleaning impossible",
+    0x2E: "maintenance box full",
+    0x37: "front cover open",
 }
 
 
@@ -154,35 +173,67 @@ def snmp_query(ip: str, packet: bytes, port: int, timeout: float) -> bytes:
 
 
 def parse_st2(data: bytes) -> dict:
-    """Split an ST2 status block ('@BDC ST2\\r\\n...') into fields."""
+    """
+    Parse an ST2 status block: the '@BDC ST2' marker, a 2-byte little-endian
+    payload length, then type/length/value fields.
+
+    The EcoTank ink field (0x0F) holds one entry per tank, each `width` bytes
+    wide: [slot, colourCode, ..., percent], where 'percent' is the LAST byte of
+    the entry. Colour is the 2nd byte (colourCode), NOT the slot -- the slot
+    numbers are arbitrary on EcoTank. A raw value of 0xFF means 'no data'; values
+    above 100 mean the tank is above the full line, i.e. full.
+    """
     m = re.search(rb"@BDC ST2\r?\n", data)
     if not m:
         raise ValueError("no ST2 status response (unexpected SNMP format)")
     rest = data[m.end() :]
-    report = {"ink": [], "tanks": None, "status": None, "status_text": None}
-    while len(rest) >= 2:
-        ftype, length = rest[0], rest[1]
-        field, rest = rest[2 : 2 + length], rest[2 + length :]
-        if len(field) < length:
+    if len(rest) < 2:
+        raise ValueError("truncated ST2 status block")
+    total = struct.unpack_from("<H", rest, 0)[0]
+    body = rest[2 : 2 + total]
+    report = {
+        "ink": [],
+        "tanks": None,
+        "status": None,
+        "status_text": None,
+        "error": None,
+        "error_text": None,
+        "serial": None,
+    }
+    pos = 0
+    while pos + 2 <= len(body):
+        ftype, length = body[pos], body[pos + 1]
+        pos += 2
+        if pos + length > len(body):
             break
-        if ftype == 0x01:  # device state
-            if field:
-                st = field[0]
-                report["status"] = st
-                report["status_text"] = STATUS_LABELS.get(st, f"State {st}")
-        elif ftype == 0x0F:  # ink levels
-            if len(field) < 3:
+        field = body[pos : pos + length]
+        pos += length
+        if ftype == 0x01 and field:  # device state
+            st = field[0]
+            report["status"] = st
+            report["status_text"] = STATUS_LABELS.get(st, f"State {st}")
+        elif ftype == 0x02 and field:  # error code
+            code = field[0]
+            report["error"] = code
+            report["error_text"] = ERROR_NAMES.get(code, f"error code 0x{code:02x}")
+        elif ftype == 0x0F:  # ink levels (EcoTank: width, then [slot,colour,...,%]*)
+            if len(field) < 2:
                 continue
-            entry_len = field[0]
-            off = 1
-            while off + 2 <= len(field):
-                color, value = field[off], field[off + 2]
-                off += max(entry_len, 3)
-                name = INK_NAMES.get(color, f"Ink 0x{color:02x}")
-                report["ink"].append((name, value if value <= 100 else None))
+            width = field[0]
+            if width < 3:
+                continue
+            for i in range((len(field) - 1) // width):
+                base = 1 + i * width
+                colour_code = field[base + 1]
+                raw = field[base + width - 1]
+                value = None if raw == 0xFF else min(raw, 100)
+                name = INK_NAMES.get(colour_code, f"colour 0x{colour_code:02x}")
+                report["ink"].append((name, value))
         elif ftype == 0x0D:  # maintenance tanks (waste ink)
             if len(field) >= 2:
                 report["tanks"] = (field[0], field[1])
+        elif ftype == 0x40:  # serial number
+            report["serial"] = field.decode("ascii", "replace").rstrip(" \x00")
     return report
 
 
@@ -193,14 +244,18 @@ def get_status(ip: str, snmp_port: int, timeout: float) -> dict:
 def print_status_report(b: dict) -> None:
     if b.get("status_text"):
         print(f"  Printer state : {b['status_text']}")
+    if b.get("error_text"):
+        print(f"  Error         : {b['error_text']}")
     for name, value in b.get("ink", []):
         if value is None:
-            print(f"  Ink           : {name} (value not interpretable)")
+            print(f"  Ink           : {name} (level not reported)")
         else:
             print(f"  Ink           : {name} ~{value}%")
     if b.get("tanks"):
         t1, t2 = b["tanks"]
         print(f"  Maintenance   : tank1 {t1}% / tank2 {t2}% (waste ink, if reported)")
+    if b.get("serial"):
+        print(f"  Serial        : {b['serial']}")
 
 
 # ---------------------------------------------------------------------------
